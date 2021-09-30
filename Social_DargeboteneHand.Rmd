@@ -1,0 +1,222 @@
+---
+title: "Social -- Dargebotene Hand"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+# knitr options
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# load packages
+library(dplyr)
+library(tidyr)
+library(readr)
+library(stringr)
+library(lubridate)
+library(purrr)
+library(janitor)
+library(here)
+library(readxl)
+```
+
+# Import excel data
+
+```{r 'read data'}
+dh_path <- Sys.getenv("dh_path")
+file_paths <- here(dh_path, list.files(path = dh_path))
+dat_in <- map(file_paths, ~read_excel(path = .x, skip = 2))
+```
+
+# Data tidying
+
+Prepare clean variables and rename unnamed variables. 
+
+```{r 'clean data'}
+clean_data <- function(raw_data){
+  data_cleaned <- raw_data %>%
+    clean_names() %>%
+    rename(gruppe = x1,
+           variable = x2) %>% 
+    # remove rows with NAs only
+    filter_all(any_vars(!is.na(.))) %>% 
+    slice(-1) %>% 
+    # complete dataframe
+    fill(gruppe, .direction = "down") %>% 
+     # remove some variables
+    filter(!(grepl(pattern = c("Arit|Median|Elt"), x = variable))) %>%
+    filter(!(grepl(pattern = c("hnreg|erhil|Sprache"), x = gruppe))) %>% 
+    # remove percentage data
+    select(-in_prozent)
+  return(data_cleaned)
+}
+
+dat_clean <- map(dat_in, ~clean_data(raw_data = .x))
+```
+
+## Validation 1: check sums
+
+Compare the total number of calls in column `Anzahl` to the sum of calls in variable `Gruppe` for value 'Schicht'.
+
+```{r 'check sums'}
+check1 <- function(raw_data, cleaned_data){
+  anzahl_anrufe_total <- raw_data %>% 
+    slice(1) %>% 
+    .$Anzahl
+  
+  check <- cleaned_data %>%
+    filter(gruppe == "Schicht") %>% 
+    group_by(gruppe) %>% 
+    summarise(
+      sum_anzahl = sum(anzahl)
+    ) %>% 
+    ungroup() %>% 
+    mutate(
+      check_boolean = anzahl_anrufe_total == sum_anzahl
+    )
+  
+  # Stop script if check is FALSE
+  if (check$check_boolean == FALSE) {
+    stop("Check 1 of Validation 1 is FALSE. Please evaluate error in code chunk 'check-1'")
+    
+  } else {
+    return(TRUE)
+  }
+}
+
+# The check function is applied to each file
+map2_lgl(.x = dat_in, .y = dat_clean, ~check1(raw_data = .x, cleaned_data = .y)) %>% 
+  all()
+```
+
+# Add metadata 
+
+Relevant metadata is stored in the file names. This metadata is extracted and added to the cleaned data.
+
+```{r 'extract metadata'}
+
+add_metadata <- function(cleaned_data, path_to_files){
+  
+  # number of files
+  no_files <- length(list.files(path = path_to_files))
+  
+  # extract file_id, month and year from file names
+  dat_filename <- tibble(
+    file_id = seq(no_files),
+    file_name = list.files(path = path_to_files)) %>% 
+    separate(col = file_name, into = c("a", "b", "c", "d"), sep = c(19, 24, 26)) %>% 
+    separate(col = d, into = c("e", "f"), sep = ".xlsx") %>% 
+    select(-a, -e, -f) %>% 
+    mutate(jahr = str_replace(b, pattern = "-", replacement = "")) %>% 
+    select(-b) %>% 
+    rename("monat" = c) %>% 
+    mutate(jahr = str_replace(jahr, "_", "")) %>% 
+    split(seq(no_files))
+    
+  # combine cleaned data and extracted metadata
+  dat_combined <- map2(.x = dat_filename, .y = cleaned_data, ~cbind(.x, .y))
+  return(dat_combined)
+}
+
+dat_final <- add_metadata(dat_clean, dh_path)
+```
+
+
+# Bring monthly data into Covid19-Monitoring format
+
+```{r 'covid19 monitoring format'}
+dat_export <- bind_rows(dat_final) %>% 
+  rename("value" = anzahl) %>% 
+  mutate(monat = as.numeric(monat)) %>% 
+  unite(date, c("monat", "jahr"), sep = "-", remove = F) %>% 
+  mutate(date = dmy(paste(days_in_month(monat), format(date, format = "%m-%y"), sep = "-"))) %>% 
+  select(-file_id, -monat, -jahr) %>% 
+  group_by(date, gruppe) %>% 
+  # summarize Schicht group
+  summarize(variable = if_else(gruppe == "Schicht", "total", variable),
+            value = if_else(gruppe == "Schicht", sum(value), value),
+            date = date) %>% 
+  ungroup() %>% 
+  distinct() %>% 
+  mutate(gruppe = if_else(gruppe == "Schicht", "Kontaktaufnahmen", gruppe),
+         variable = case_when(variable == "Ablehnung, ev. gesperrt" ~ "Schweigeanruf",
+                              variable == "Vereinbarung" ~ "Regelmässiger Kontakt",
+                              TRUE ~ variable)) %>% 
+  unite(variable_long, c("gruppe", "variable"), sep = " ") %>% 
+  group_by(date, variable_long) %>% 
+  summarize(value = sum(value)) %>% 
+  ungroup() %>% 
+  complete(date, nesting(variable_long)) %>% 
+  mutate(topic = "Soziales",
+         location = "ZH",
+         unit = "Anzahl",
+         source = "Dargebotene Hand",
+         update = "monatlich",
+         public = "ja",
+         description = "https://github.com/statistikZH/covid19monitoring_social_DargeboteneHand/blob/main/README.md") %>% 
+  relocate(c(date,value, topic), .before = variable_long) %>% 
+  mutate(variable_short = case_when(variable_long == "Kontaktaufnahmen total" ~ "kontaktaufnahmen_total",
+                                    variable_long == "Geschlecht Weiblich" ~ "geschlecht_weiblich",
+                                    variable_long == "Geschlecht Männlich" ~ "geschlecht_maennlich",
+                                    variable_long == "Geschlecht nicht bestimmbar" ~ "geschlecht_unbestimmt",
+                                    variable_long == "Alter bis 18 J." ~ "alter_bis_18",
+                                    variable_long == "Alter 19 - 40 J." ~ "alter_19_bis_40",
+                                    variable_long == "Alter 41 - 65 J." ~ "alter_41_bis_65",
+                                    variable_long == "Alter über 65 J." ~ "alter_ue65",
+                                    variable_long == "Alter nicht bestimmbar" ~ "alter_unbestimmt",
+                                    variable_long == "Kontakthäufigkeit Erster Kontakt" ~ "kontakt_erstmalig",
+                                    variable_long == "Kontakthäufigkeit Gelegentlicher, wiederholter Kontakt" ~ "kontakt_gelegentlich",
+                                    variable_long == "Kontakthäufigkeit Regelmässiger Kontakt" ~ "kontakt_regelmaessig",
+                                    variable_long == "Beratungsinhalt Alltagsbewältigung" ~ "inhalt_alltagsbewaeltigung",
+                                    variable_long == "Beratungsinhalt Psychisches Leiden" ~ "inhalt_leiden_psychisch",
+                                    variable_long == "Beratungsinhalt Sorge wegen Infektion" ~ "inhalt_sorge_infektion",
+                                    variable_long == "Beratungsinhalt Körperliches Leiden" ~ "inhalt_leiden_koerperlich",
+                                    variable_long == "Beratungsinhalt Einsamkeit" ~ "inhalt_einsamkeit",
+                                    variable_long == "Beratungsinhalt Familie / Erziehung" ~ "inhalt_familie_erziehung",
+                                    variable_long == "Beratungsinhalt Beziehung allgemein" ~ "inhalt_beziehung_allgemein",
+                                    variable_long == "Beratungsinhalt Paarbeziehung" ~ "inhalt_paarbeziehung",
+                                    variable_long == "Beratungsinhalt Arbeit / Ausbildung" ~ "inhalt_arbeit_ausbildung",
+                                    variable_long == "Beratungsinhalt Existenzprobleme" ~ "inhalt_existenzprobleme",
+                                    variable_long == "Beratungsinhalt Gewalt" ~ "inhalt_gewalt",
+                                    variable_long == "Beratungsinhalt Sexualität" ~ "inhalt_sexualitaet",
+                                    variable_long == "Beratungsinhalt Spiritualität / Lebenssinn" ~ "inhalt_spiritualitaet_lebenssinn",
+                                    variable_long == "Beratungsinhalt Suchtverhalten" ~ "inhalt_suchtverhalten",
+                                    variable_long == "Beratungsinhalt Suizidalität" ~ "inhalt_suizidalitaet",
+                                    variable_long == "Beratungsinhalt Verlust / Trauer / Tod" ~ "inhalt_verlust_trauer_tod",
+                                    variable_long == "Beratungsinhalt Verschiedenes" ~ "inhalt_verschiedenes",
+                                    variable_long == "Beratungsinhalt Medienerziehung/Swisscom" ~ "inhalt_medienerziehung_swisscom",
+                                    variable_long == "Zusätzliche Beanspruchung Verschobenes Gespräch" ~ "zus_beanspruchung_verschobenes_gespraech",
+                                    variable_long == "Zusätzliche Beanspruchung Schweigeanruf" ~ "zus_beanspruchung_schweigeanruf",
+                                    variable_long == "Zusätzliche Beanspruchung Fehlanruf" ~ "zus_beanspruchung_fehlanruf",
+                                    variable_long == "Zusätzliche Beanspruchung Juxanruf" ~ "zus_beanspruchung_juxanruf",
+                                    variable_long == "Zusätzliche Beanspruchung aufgelegt" ~ "zus_beanspruchung_aufgelegt",
+                                    variable_long == "Geschlecht Divers" ~ "geschlecht_divers",
+                                    variable_long == "Zusätzliche Beanspruchung Chat ohne Inhalt" ~ "zus_beanspruchung_chat_ohne_inhalt",
+                                    TRUE ~ "no_case"
+                                    )) %>% 
+  relocate(variable_short, .after = variable_long) 
+```
+
+## Validation 2: check variable_short
+
+```{r 'checkk variable_short'}
+# check whether there are any "no_case" variables
+if(any(dat_export$variable_short == "no_case")){
+  stop("Some variables do not have a 'variable_short' definition!")
+}
+```
+
+
+# Data Export
+
+Write CSV for monthly data.
+
+```{r 'write data'}
+write_csv(dat_export,  here("Social_DargeboteneHand.csv"))
+```
